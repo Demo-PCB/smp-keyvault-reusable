@@ -265,6 +265,11 @@ jobs:
     outputs:
       artifact-path: ${{ steps.publish.outputs.artifact-path }}
     steps:
+      - name: Checkout repository metadata
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download packaged artifact
         uses: actions/download-artifact@v4
         with:
