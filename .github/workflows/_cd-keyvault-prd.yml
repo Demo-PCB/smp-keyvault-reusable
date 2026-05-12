@@ -254,7 +254,7 @@ jobs:
 
       - name: Preview Key Vault changes
         id: preview
-        uses: Demo-PCB/dso-keyvault-reusable/.github/actions/keyvault-dry-run@main
+        uses: Demo-PCB/smp-keyvault-reusable/.github/actions/keyvault-dry-run@main
         with:
           keyvault-name: ${{ needs.prepare.outputs.keyvault-name }}
           data-file-path: ./deployment/data.json
@@ -288,14 +288,14 @@ jobs:
 
       - name: Create missing secrets safely
         id: apply
-        uses: Demo-PCB/dso-keyvault-reusable/.github/actions/keyvault-apply@main
+        uses: Demo-PCB/smp-keyvault-reusable/.github/actions/keyvault-apply@main
         with:
           keyvault-name: ${{ needs.prepare.outputs.keyvault-name }}
           data-file-path: ./deployment/data.json
           initial-secret-value: ${{ inputs.initial-secret-value }}
 
       - name: Verify visible secrets
-        uses: Demo-PCB/dso-keyvault-reusable/.github/actions/keyvault-verify@main
+        uses: Demo-PCB/smp-keyvault-reusable/.github/actions/keyvault-verify@main
         with:
           keyvault-name: ${{ needs.prepare.outputs.keyvault-name }}
 
