@@ -1,0 +1,70 @@
+name: Key Vault Dry Run
+description: Preview which Azure Key Vault secrets will be created, skipped, or left unchanged.
+inputs:
+  keyvault-name:
+    description: Azure Key Vault name
+    required: true
+  data-file-path:
+    description: Path to data.json containing secret names
+    required: true
+  initial-secret-value:
+    description: Initial placeholder value expected for new secrets
+    required: false
+    default: DEMO
+outputs:
+  planned-created-count:
+    description: Number of missing secrets planned for creation
+    value: ${{ steps.preview.outputs.planned-created-count }}
+  planned-skipped-count:
+    description: Number of existing secrets skipped because they contain protected real values
+    value: ${{ steps.preview.outputs.planned-skipped-count }}
+  planned-demo-count:
+    description: Number of existing secrets already containing the initial value
+    value: ${{ steps.preview.outputs.planned-demo-count }}
+runs:
+  using: composite
+  steps:
+    - name: Preview Key Vault changes
+      id: preview
+      shell: bash
+      run: |
+        set -euo pipefail
+        KEYVAULT_NAME='${{ inputs.keyvault-name }}'
+        DATA_FILE='${{ inputs.data-file-path }}'
+        INITIAL_VALUE='${{ inputs.initial-secret-value }}'
+        CREATED=0
+        SKIPPED=0
+        DEMO=0
+
+        if [ ! -f "$DATA_FILE" ]; then
+          echo "::error::Data file not found: $DATA_FILE"
+          exit 1
+        fi
+
+        echo '### Key Vault dry run preview' >> "$GITHUB_STEP_SUMMARY"
+        echo '' >> "$GITHUB_STEP_SUMMARY"
+        echo '| Secret | Action | Reason |' >> "$GITHUB_STEP_SUMMARY"
+        echo '|---|---|---|' >> "$GITHUB_STEP_SUMMARY"
+
+        while IFS= read -r SECRET_NAME; do
+          if CURRENT_VALUE=$(az keyvault secret show --vault-name "$KEYVAULT_NAME" --name "$SECRET_NAME" --query value -o tsv 2>/dev/null); then
+            if [ "$CURRENT_VALUE" = "$INITIAL_VALUE" ]; then
+              ACTION='NO_CHANGE'
+              REASON='Secret exists with initial DEMO value'
+              DEMO=$((DEMO + 1))
+            else
+              ACTION='SKIP_PROTECTED_VALUE'
+              REASON='Secret exists with non-DEMO value'
+              SKIPPED=$((SKIPPED + 1))
+            fi
+          else
+            ACTION='CREATE'
+            REASON='Secret is missing and will be created with DEMO'
+            CREATED=$((CREATED + 1))
+          fi
+          echo "| $SECRET_NAME | $ACTION | $REASON |" >> "$GITHUB_STEP_SUMMARY"
+        done < <(jq -r 'keys[]' "$DATA_FILE")
+
+        echo "planned-created-count=$CREATED" >> "$GITHUB_OUTPUT"
+        echo "planned-skipped-count=$SKIPPED" >> "$GITHUB_OUTPUT"
+        echo "planned-demo-count=$DEMO" >> "$GITHUB_OUTPUT"

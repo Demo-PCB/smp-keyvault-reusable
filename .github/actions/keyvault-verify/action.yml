@@ -1,0 +1,23 @@
+name: Key Vault Verify
+description: Verify visible Azure Key Vault secret names after deployment.
+inputs:
+  keyvault-name:
+    description: Azure Key Vault name
+    required: true
+outputs:
+  visible-count:
+    description: Number of visible secrets in the vault
+    value: ${{ steps.verify.outputs.visible-count }}
+runs:
+  using: composite
+  steps:
+    - name: Verify visible secrets
+      id: verify
+      shell: bash
+      run: |
+        set -euo pipefail
+        KEYVAULT_NAME='${{ inputs.keyvault-name }}'
+        COUNT=$(az keyvault secret list --vault-name "$KEYVAULT_NAME" --query 'length(@)' -o tsv)
+        echo "visible-count=$COUNT" >> "$GITHUB_OUTPUT"
+        echo "Visible secrets in $KEYVAULT_NAME: $COUNT"
+        az keyvault secret list --vault-name "$KEYVAULT_NAME" --query '[].name' -o table

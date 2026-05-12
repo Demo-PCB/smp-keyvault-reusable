@@ -1,0 +1,331 @@
+name: CD - Azure Key Vault (DEV)
+
+on:
+  workflow_call:
+    inputs:
+      application:
+        description: 'Application name for JFrog path'
+        required: true
+        type: string
+      component-name:
+        description: 'Component name'
+        required: false
+        type: string
+        default: ${{ github.event.repository.name }}
+      version:
+        description: 'Artifact version to deploy. Example: 1.0.0-42. If empty on workflow_run, it is computed from config.yml version and workflow_run.run_number.'
+        required: false
+        type: string
+        default: ''
+      environment:
+        description: 'Target environment from config.yml'
+        required: false
+        type: string
+        default: 'dev'
+      config-file-path:
+        description: 'Path to keyvault/config.yml'
+        required: false
+        type: string
+        default: 'keyvault/config.yml'
+      artifactory-url:
+        description: 'Optional JFrog URL override. If empty, uses vars.IBK_ARTIFACTORY_URL or secrets.ARTIFACTORY_URL'
+        required: false
+        type: string
+        default: ''
+      initial-secret-value:
+        description: 'Initial value for newly created secrets'
+        required: false
+        type: string
+        default: 'DEMO'
+      FLAG_DRY_RUN_ONLY:
+        description: 'Preview only; do not create missing secrets'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      DSO_ARTIFACTORY_TOKEN:
+        description: 'JFrog access token'
+        required: true
+      ARTIFACTORY_URL:
+        description: 'Optional JFrog URL fallback'
+        required: false
+      AZURE_CLIENT_ID:
+        description: 'Azure App Registration client id for OIDC'
+        required: true
+      AZURE_TENANT_ID:
+        description: 'Azure tenant id'
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        description: 'Azure subscription id'
+        required: true
+    outputs:
+      deployment-status:
+        description: 'Deployment status'
+        value: ${{ jobs.deploy.outputs.status }}
+      created-count:
+        description: 'Created secrets count'
+        value: ${{ jobs.deploy.outputs.created-count }}
+      skipped-count:
+        description: 'Skipped secrets count'
+        value: ${{ jobs.deploy.outputs.skipped-count }}
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ENVIRONMENT: dev
+  ENVIRONMENT_UPPER: DEV
+
+jobs:
+  prepare:
+    name: Prepare Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      artifact-name: ${{ steps.artifact.outputs.artifact-name }}
+      artifact-path: ${{ steps.artifact.outputs.artifact-path }}
+      keyvault-name: ${{ steps.config.outputs.keyvault-name }}
+      resource-group: ${{ steps.config.outputs.resource-group }}
+      artifactory-url: ${{ steps.resolve-artifactory.outputs.url }}
+      target-environment: ${{ steps.target.outputs.environment }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Resolve target environment
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENVIRONMENT='${{ inputs.environment }}'
+          if [ -z "$ENVIRONMENT" ]; then
+            ENVIRONMENT='dev'
+          fi
+          echo "environment=${ENVIRONMENT}" >> "$GITHUB_OUTPUT"
+          echo "ENVIRONMENT=${ENVIRONMENT}" >> "$GITHUB_ENV"
+          echo "ENVIRONMENT_UPPER=$(echo "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')" >> "$GITHUB_ENV"
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='${{ inputs.version }}'
+          if [ -z "$VERSION" ]; then
+            CONFIG_FILE='${{ inputs.config-file-path }}'
+            PROJECT_VERSION=$(grep -E '^version:' "$CONFIG_FILE" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'" || true)
+            if [ -z "$PROJECT_VERSION" ]; then
+              PROJECT_VERSION='1.0.0'
+            fi
+            RUN_NUMBER='${{ github.event.workflow_run.run_number || '' }}'
+            if [ -z "$RUN_NUMBER" ]; then
+              echo '::error::Version input is required for manual execution.'
+              exit 1
+            fi
+            VERSION="${PROJECT_VERSION}-${RUN_NUMBER}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Deploying artifact version $VERSION"
+
+      - name: Calculate artifact details
+        id: artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='${{ steps.version.outputs.version }}'
+          ARTIFACT_NAME='${{ inputs.component-name }}-keyvault-'"${VERSION}"
+          LOWER_APP=$(echo '${{ inputs.application }}' | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+          PREFIX=$(echo '${{ inputs.application }}' | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+          ARTIFACT_PATH="${PREFIX}-generic-snapshot/${LOWER_APP}/${{ inputs.component-name }}/${VERSION}/${ARTIFACT_NAME}.zip"
+          echo "artifact-name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "artifact-path=${ARTIFACT_PATH}" >> "$GITHUB_OUTPUT"
+
+      - name: Load environment configuration
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE='${{ inputs.config-file-path }}'
+          ENVIRONMENT='${{ steps.target.outputs.environment }}'
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "::error::config.yml not found at $CONFIG_FILE"
+            exit 1
+          fi
+
+          KEYVAULT_NAME=$(awk -v env="$ENVIRONMENT" '
+            $0 ~ "^" env ":" { in_env=1; next }
+            in_env && /^[A-Za-z0-9_-]+:/ { exit }
+            in_env && $1 == "keyvault-name:" { print $2; exit }
+            in_env && $1 == "resourceName:" { print $2; exit }
+          ' "$CONFIG_FILE" | tr -d '"' | tr -d "'")
+
+          RESOURCE_GROUP=$(awk -v env="$ENVIRONMENT" '
+            $0 ~ "^" env ":" { in_env=1; next }
+            in_env && /^[A-Za-z0-9_-]+:/ { exit }
+            in_env && $1 == "resource-group:" { print $2; exit }
+          ' "$CONFIG_FILE" | tr -d '"' | tr -d "'")
+
+          if [ -z "$KEYVAULT_NAME" ]; then
+            echo "::error::No keyvault-name/resourceName found for environment $ENVIRONMENT in $CONFIG_FILE"
+            exit 1
+          fi
+          echo "keyvault-name=${KEYVAULT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "resource-group=${RESOURCE_GROUP}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve JFrog URL
+        id: resolve-artifactory
+        shell: bash
+        run: |
+          URL='${{ inputs.artifactory-url }}'
+          if [ -z "$URL" ]; then URL='${{ vars.IBK_ARTIFACTORY_URL }}'; fi
+          if [ -z "$URL" ]; then URL='${{ secrets.ARTIFACTORY_URL }}'; fi
+          URL="${URL%/}"
+          URL="${URL%/artifactory}"
+          if [ -z "$URL" ]; then
+            echo '::error::Missing JFrog URL. Set input artifactory-url, vars.IBK_ARTIFACTORY_URL or secrets.ARTIFACTORY_URL.'
+            exit 1
+          fi
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+
+  download-artifact:
+    name: Download Artifact from JFrog
+    runs-on: ubuntu-latest
+    needs: [prepare]
+    steps:
+      - name: Validate JFrog configuration
+        shell: bash
+        run: |
+          if [ -z '${{ needs.prepare.outputs.artifactory-url }}' ] || [ -z '${{ secrets.DSO_ARTIFACTORY_TOKEN }}' ]; then
+            echo '::error::Missing JFrog configuration.'
+            exit 1
+          fi
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ needs.prepare.outputs.artifactory-url }}
+          JF_ACCESS_TOKEN: ${{ secrets.DSO_ARTIFACTORY_TOKEN }}
+
+      - name: Download artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          ARTIFACT_PATH='${{ needs.prepare.outputs.artifact-path }}'
+          ARTIFACT_NAME='${{ needs.prepare.outputs.artifact-name }}'
+          jf rt download "$ARTIFACT_PATH" ./artifact/ --flat=true
+          jf rt download "${ARTIFACT_PATH}.sha256" ./artifact/ --flat=true || echo '::warning::Checksum not found'
+          test -f "./artifact/${ARTIFACT_NAME}.zip"
+          if [ -f "./artifact/${ARTIFACT_NAME}.zip.sha256" ]; then
+            (cd artifact && sha256sum -c "${ARTIFACT_NAME}.zip.sha256")
+          fi
+          unzip -o "./artifact/${ARTIFACT_NAME}.zip" -d artifact/extracted
+          test -f artifact/extracted/data.json
+
+      - name: Upload extracted deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: keyvault-deployment-${{ needs.prepare.outputs.target-environment }}
+          path: artifact/extracted/
+          retention-days: 1
+
+  dry-run:
+    name: Dry Run Preview
+    runs-on: ubuntu-latest
+    needs: [prepare, download-artifact]
+    outputs:
+      planned-created-count: ${{ steps.preview.outputs.planned-created-count }}
+      planned-skipped-count: ${{ steps.preview.outputs.planned-skipped-count }}
+      planned-demo-count: ${{ steps.preview.outputs.planned-demo-count }}
+    steps:
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: keyvault-deployment-${{ needs.prepare.outputs.target-environment }}
+          path: ./deployment
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Preview Key Vault changes
+        id: preview
+        uses: Demo-PCB/dso-keyvault-reusable/.github/actions/keyvault-dry-run@main
+        with:
+          keyvault-name: ${{ needs.prepare.outputs.keyvault-name }}
+          data-file-path: ./deployment/data.json
+          initial-secret-value: ${{ inputs.initial-secret-value }}
+
+
+  deploy:
+    name: Apply Key Vault Changes
+    runs-on: ubuntu-latest
+    needs: [prepare, download-artifact, dry-run]
+    if: ${{ inputs.FLAG_DRY_RUN_ONLY != true }}
+    environment: dev
+    outputs:
+      status: ${{ steps.apply.outputs.status }}
+      created-count: ${{ steps.apply.outputs.created-count }}
+      skipped-count: ${{ steps.apply.outputs.skipped-count }}
+      demo-count: ${{ steps.apply.outputs.demo-count }}
+    steps:
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: keyvault-deployment-${{ needs.prepare.outputs.target-environment }}
+          path: ./deployment
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Create missing secrets safely
+        id: apply
+        uses: Demo-PCB/dso-keyvault-reusable/.github/actions/keyvault-apply@main
+        with:
+          keyvault-name: ${{ needs.prepare.outputs.keyvault-name }}
+          data-file-path: ./deployment/data.json
+          initial-secret-value: ${{ inputs.initial-secret-value }}
+
+      - name: Verify visible secrets
+        uses: Demo-PCB/dso-keyvault-reusable/.github/actions/keyvault-verify@main
+        with:
+          keyvault-name: ${{ needs.prepare.outputs.keyvault-name }}
+
+
+  post-deploy:
+    name: Post Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [prepare, dry-run, deploy]
+    if: always()
+    steps:
+      - name: Generate summary
+        shell: bash
+        run: |
+          STATUS="${{ needs.deploy.outputs.status }}"
+          if [ -z "$STATUS" ]; then STATUS='skipped'; fi
+          if [ '${{ inputs.FLAG_DRY_RUN_ONLY }}' = 'true' ]; then STATUS='dry-run-only'; fi
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF_SUMMARY
+          # Key Vault CD Summary - ${{ needs.prepare.outputs.target-environment }}
+
+          | Property | Value |
+          |---|---|
+          | Application | ${{ inputs.application }} |
+          | Component | ${{ inputs.component-name }} |
+          | Version | \`${{ needs.prepare.outputs.version }}\` |
+          | Environment | ${{ needs.prepare.outputs.target-environment }} |
+          | Key Vault | ${{ needs.prepare.outputs.keyvault-name }} |
+          | Status | $STATUS |
+          | Created | ${{ needs.deploy.outputs.created-count || '0' }} |
+          | Skipped protected | ${{ needs.deploy.outputs.skipped-count || '0' }} |
+          | Existing DEMO | ${{ needs.deploy.outputs.demo-count || '0' }} |
+
+          Policy: missing secrets are created with `${{ inputs.initial-secret-value }}`; existing non-DEMO values are never overwritten.
+          EOF_SUMMARY

@@ -1,0 +1,334 @@
+name: CI - Azure Key Vault
+
+on:
+  workflow_call:
+    inputs:
+      application:
+        description: 'Application name used for artifact naming and JFrog path'
+        required: true
+        type: string
+      component-name:
+        description: 'Component name'
+        required: false
+        type: string
+        default: ${{ github.event.repository.name }}
+      data-file-path:
+        description: 'Path to keyvault/data.json'
+        required: false
+        type: string
+        default: 'keyvault/data.json'
+      config-file-path:
+        description: 'Path to keyvault/config.yml'
+        required: false
+        type: string
+        default: 'keyvault/config.yml'
+      artifactory-url:
+        description: 'Optional JFrog base URL. If empty, uses vars.IBK_ARTIFACTORY_URL or secrets.ARTIFACTORY_URL'
+        required: false
+        type: string
+        default: ''
+      FLAG_RUN_SECRET_SCAN:
+        description: 'Run Gitleaks secret scan'
+        required: false
+        type: boolean
+        default: true
+      FLAG_PUBLISH_ARTIFACTS:
+        description: 'Publish artifact to JFrog'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      DSO_ARTIFACTORY_TOKEN:
+        description: 'JFrog access token'
+        required: false
+      ARTIFACTORY_URL:
+        description: 'Optional JFrog base URL fallback'
+        required: false
+    outputs:
+      version:
+        description: 'Computed artifact version'
+        value: ${{ jobs.summary.outputs.version }}
+      artifact-name:
+        description: 'Artifact name without .zip'
+        value: ${{ jobs.summary.outputs.artifact-name }}
+      artifact-path:
+        description: 'JFrog path'
+        value: ${{ jobs.summary.outputs.artifact-path }}
+
+permissions:
+  contents: read
+
+env:
+  ARTIFACT_RETENTION_DAYS: 90
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      project-version: ${{ steps.version.outputs.project-version }}
+      version: ${{ steps.version.outputs.version }}
+      artifact-name: ${{ steps.version.outputs.artifact-name }}
+      artifact-path: ${{ steps.artifact-path.outputs.artifact-path }}
+      lower-app-name: ${{ steps.names.outputs.lower-app-name }}
+      publish-artifacts: ${{ steps.publish-check.outputs.publish }}
+      artifactory-url: ${{ steps.resolve-artifactory.outputs.url }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Generate application name variants
+        id: names
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOWER_APP_NAME=$(echo '${{ inputs.application }}' | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+          echo "lower-app-name=${LOWER_APP_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract and compute version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_FILE='${{ inputs.config-file-path }}'
+          PROJECT_VERSION='1.0.0'
+          if [ -f "$CONFIG_FILE" ]; then
+            PROJECT_VERSION=$(grep -E '^version:' "$CONFIG_FILE" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'" || true)
+            [ -n "$PROJECT_VERSION" ] || PROJECT_VERSION='1.0.0'
+          fi
+          FULL_VERSION="${PROJECT_VERSION}-${{ github.run_number }}"
+          ARTIFACT_NAME='${{ inputs.component-name }}-keyvault-'"${FULL_VERSION}"
+          echo "project-version=${PROJECT_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version=${FULL_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "artifact-name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine if artifact should be published
+        id: publish-check
+        shell: bash
+        run: |
+          if [[ '${{ github.ref }}' == 'refs/heads/main' || '${{ github.ref }}' == 'refs/heads/develop' ]]; then
+            echo 'publish=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve Artifactory URL
+        id: resolve-artifactory
+        shell: bash
+        run: |
+          URL='${{ inputs.artifactory-url }}'
+          if [ -z "$URL" ]; then
+            URL='${{ vars.IBK_ARTIFACTORY_URL }}'
+          fi
+          if [ -z "$URL" ]; then
+            URL='${{ secrets.ARTIFACTORY_URL }}'
+          fi
+          URL="${URL%/}"
+          URL="${URL%/artifactory}"
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate JFrog artifact path
+        id: artifact-path
+        shell: bash
+        run: |
+          PREFIX=$(echo '${{ inputs.application }}' | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+          LOWER_APP='${{ steps.names.outputs.lower-app-name }}'
+          VERSION='${{ steps.version.outputs.version }}'
+          ARTIFACT_NAME='${{ steps.version.outputs.artifact-name }}'
+          ARTIFACT_PATH="${PREFIX}-generic-snapshot/${LOWER_APP}/${{ inputs.component-name }}/${VERSION}/${ARTIFACT_NAME}.zip"
+          echo "artifact-path=${ARTIFACT_PATH}" >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate Key Vault files
+    runs-on: ubuntu-latest
+    needs: [prepare]
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Validate data.json and config.yml
+        shell: bash
+        run: |
+          set -euo pipefail
+          DATA_FILE='${{ inputs.data-file-path }}'
+          CONFIG_FILE='${{ inputs.config-file-path }}'
+
+          if [ ! -f "$DATA_FILE" ]; then
+            echo "::error::data.json not found at $DATA_FILE"
+            exit 1
+          fi
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "::error::config.yml not found at $CONFIG_FILE"
+            exit 1
+          fi
+
+          jq -e 'type == "object"' "$DATA_FILE" > /dev/null
+          KEY_COUNT=$(jq 'keys | length' "$DATA_FILE")
+          if [ "$KEY_COUNT" -eq 0 ]; then
+            echo '::error::data.json must contain at least one secret name'
+            exit 1
+          fi
+
+          INVALID_NAMES=$(jq -r 'keys[] | select(test("^[A-Za-z0-9-]+$") | not)' "$DATA_FILE")
+          if [ -n "$INVALID_NAMES" ]; then
+            echo '::error::Invalid Key Vault secret names. Use only letters, numbers and hyphen (-).'
+            echo "$INVALID_NAMES"
+            exit 1
+          fi
+
+          python3 - <<PY
+          import yaml
+          with open('${{ inputs.config-file-path }}', 'r', encoding='utf-8') as f:
+              cfg = yaml.safe_load(f)
+          assert isinstance(cfg, dict), 'config.yml must be a YAML object'
+          assert 'version' in cfg, 'config.yml must contain version'
+          PY
+
+          echo "::notice::Validated ${KEY_COUNT} Key Vault secret name(s). Values in data.json are ignored by CD; new secrets use DEMO."
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: [prepare]
+    if: ${{ inputs.FLAG_RUN_SECRET_SCAN }}
+    continue-on-error: true
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run Gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION='8.24.2'
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gitleaks.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks detect --source . --verbose --redact --exit-code 1
+
+  package:
+    name: Create Package
+    runs-on: ubuntu-latest
+    needs: [prepare, validate]
+    outputs:
+      artifact-zip: ${{ steps.package.outputs.artifact-zip }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Create artifact package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='${{ needs.prepare.outputs.version }}'
+          ARTIFACT_NAME='${{ needs.prepare.outputs.artifact-name }}'
+          ARTIFACT_ZIP="${ARTIFACT_NAME}.zip"
+
+          mkdir -p staging
+          cp '${{ inputs.data-file-path }}' staging/data.json
+          cp '${{ inputs.config-file-path }}' staging/config.yml
+          cat > staging/metadata.json <<EOF_META
+          {
+            "application": "${{ inputs.application }}",
+            "component": "${{ inputs.component-name }}",
+            "version": "${VERSION}",
+            "projectVersion": "${{ needs.prepare.outputs.project-version }}",
+            "runNumber": "${{ github.run_number }}",
+            "sha": "${{ github.sha }}",
+            "ref": "${{ github.ref }}",
+            "repository": "${{ github.repository }}",
+            "buildTimestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF_META
+
+          (cd staging && zip -r "../${ARTIFACT_ZIP}" .)
+          sha256sum "${ARTIFACT_ZIP}" > "${ARTIFACT_ZIP}.sha256"
+          echo "artifact-zip=${ARTIFACT_ZIP}" >> "$GITHUB_OUTPUT"
+          unzip -l "${ARTIFACT_ZIP}"
+
+      - name: Upload artifact to GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.prepare.outputs.artifact-name }}
+          path: |
+            ${{ steps.package.outputs.artifact-zip }}
+            ${{ steps.package.outputs.artifact-zip }}.sha256
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+
+  publish-artifact:
+    name: Publish to JFrog
+    runs-on: ubuntu-latest
+    needs: [prepare, package]
+    if: ${{ needs.prepare.outputs.publish-artifacts == 'true' && inputs.FLAG_PUBLISH_ARTIFACTS }}
+    outputs:
+      artifact-path: ${{ steps.publish.outputs.artifact-path }}
+    steps:
+      - name: Download packaged artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.prepare.outputs.artifact-name }}
+
+      - name: Validate JFrog configuration
+        shell: bash
+        run: |
+          if [ -z '${{ needs.prepare.outputs.artifactory-url }}' ] || [ -z '${{ secrets.DSO_ARTIFACTORY_TOKEN }}' ]; then
+            echo '::error::Missing JFrog configuration. Set vars.IBK_ARTIFACTORY_URL and secrets.DSO_ARTIFACTORY_TOKEN.'
+            exit 1
+          fi
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ needs.prepare.outputs.artifactory-url }}
+          JF_ACCESS_TOKEN: ${{ secrets.DSO_ARTIFACTORY_TOKEN }}
+
+      - name: Publish artifact
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARTIFACT_ZIP='${{ needs.prepare.outputs.artifact-name }}.zip'
+          ARTIFACT_PATH='${{ needs.prepare.outputs.artifact-path }}'
+          REPO_PATH="${ARTIFACT_PATH%/*}"
+
+          jf rt upload --build-name='${{ inputs.application }}-keyvault' --build-number='${{ github.run_number }}' "${ARTIFACT_ZIP}" "${ARTIFACT_PATH}"
+          jf rt sp "${ARTIFACT_PATH}" "version=${{ needs.prepare.outputs.version }};application=${{ inputs.application }};component=${{ inputs.component-name }};sha=${{ github.sha }}"
+          jf rt upload --build-name='${{ inputs.application }}-keyvault' --build-number='${{ github.run_number }}' "${ARTIFACT_ZIP}.sha256" "${REPO_PATH}/${ARTIFACT_ZIP}.sha256"
+          jf rt build-collect-env '${{ inputs.application }}-keyvault' '${{ github.run_number }}'
+          jf rt build-add-git '${{ inputs.application }}-keyvault' '${{ github.run_number }}'
+          jf rt build-publish '${{ inputs.application }}-keyvault' '${{ github.run_number }}'
+
+          echo "artifact-path=${ARTIFACT_PATH}" >> "$GITHUB_OUTPUT"
+
+  summary:
+    name: Publish Summary
+    runs-on: ubuntu-latest
+    needs: [prepare, package, publish-artifact]
+    if: always() && needs.prepare.result == 'success' && needs.package.result == 'success'
+    outputs:
+      version: ${{ needs.prepare.outputs.version }}
+      artifact-name: ${{ needs.prepare.outputs.artifact-name }}
+      artifact-path: ${{ needs.prepare.outputs.artifact-path }}
+    steps:
+      - name: Generate CI summary
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF_SUMMARY
+          # CI Build Summary - Azure Key Vault
+
+          | Property | Value |
+          |---|---|
+          | Application | ${{ inputs.application }} |
+          | Component | ${{ inputs.component-name }} |
+          | Version | \`${{ needs.prepare.outputs.version }}\` |
+          | Artifact Name | \`${{ needs.prepare.outputs.artifact-name }}\` |
+          | JFrog Path | \`${{ needs.prepare.outputs.artifact-path }}\` |
+
+          Use this version in CD/Rollback workflows:
+
+          \`\`\`
+          ${{ needs.prepare.outputs.version }}
+          \`\`\`
+          EOF_SUMMARY
