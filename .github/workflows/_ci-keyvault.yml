@@ -75,7 +75,7 @@ jobs:
       artifactory-url: ${{ steps.resolve-artifactory.outputs.url }}
     steps:
       - name: Checkout caller repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Generate application name variants
         id: names
@@ -144,7 +144,7 @@ jobs:
     needs: [prepare]
     steps:
       - name: Checkout caller repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Validate data.json and config.yml
         shell: bash
@@ -194,7 +194,7 @@ jobs:
     continue-on-error: true
     steps:
       - name: Checkout caller repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Run Gitleaks
@@ -215,7 +215,7 @@ jobs:
       artifact-zip: ${{ steps.package.outputs.artifact-zip }}
     steps:
       - name: Checkout caller repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Create artifact package
         id: package

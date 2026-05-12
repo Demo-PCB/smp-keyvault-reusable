@@ -91,7 +91,7 @@ jobs:
       target-environment: ${{ steps.target.outputs.environment }}
     steps:
       - name: Checkout caller repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Resolve target environment
         id: target
